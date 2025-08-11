@@ -4,15 +4,224 @@
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:vsshell="clr-namespace:Microsoft.VisualStudio.Shell;assembly=Microsoft.VisualStudio.Shell.15.0"
-             Background="{DynamicResource {x:Static vsshell:VsBrushes.WindowKey}}"
-             Foreground="{DynamicResource {x:Static vsshell:VsBrushes.WindowTextKey}}"
+             Background="#1E1E1E"
+             Foreground="#E0E0E0"
              mc:Ignorable="d"
-             d:DesignHeight="300" d:DesignWidth="300"
+             d:DesignHeight="600" d:DesignWidth="800"
              Name="MyToolWindow">
+    <UserControl.Resources>
+        <!-- Modern Dark Theme Styles -->
+        <Style x:Key="ConsoleScrollViewer" TargetType="ScrollViewer">
+            <Setter Property="VerticalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="HorizontalScrollBarVisibility" Value="Disabled"/>
+            <Setter Property="Background" Value="#0A0A0A"/>
+            <Setter Property="BorderBrush" Value="#2D2D30"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
+
+        <Style x:Key="ConsoleTextBox" TargetType="TextBox">
+            <Setter Property="Background" Value="#1E1E1E"/>
+            <Setter Property="Foreground" Value="#00FF41"/>
+            <Setter Property="FontFamily" Value="Cascadia Code, Consolas, Courier New"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="BorderBrush" Value="#00FF41"/>
+            <Setter Property="BorderThickness" Value="0,1,0,0"/>
+            <Setter Property="CaretBrush" Value="#00FF41"/>
+            <Setter Property="Padding" Value="10,8"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" 
+                                          Text="&gt; " 
+                                          Foreground="#00FF41"
+                                          FontFamily="{TemplateBinding FontFamily}"
+                                          FontSize="{TemplateBinding FontSize}"
+                                          VerticalAlignment="Center"
+                                          Margin="10,0,0,0"/>
+                                <ScrollViewer Grid.Column="1" x:Name="PART_ContentHost" 
+                                            Margin="0,0,10,0"
+                                            VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="StatusLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#569CD6"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Margin" Value="5,2"/>
+        </Style>
+    </UserControl.Resources>
+
     <Grid>
-        <StackPanel Orientation="Vertical">
-            <TextBlock Margin="10" HorizontalAlignment="Center">MainToolWindow</TextBlock>
-            <Button Content="Click me!" Click="button1_Click" Width="120" Height="80" Name="button1"/>
-        </StackPanel>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="30"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="50"/>
+            <RowDefinition Height="25"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Border Grid.Row="0" Background="#252526" BorderBrush="#3F3F46" BorderThickness="0,0,0,1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="AI Assistant Console" 
+                          Foreground="#CCCCCC" 
+                          FontFamily="Segoe UI Semibold"
+                          FontSize="12"
+                          VerticalAlignment="Center"
+                          Margin="10,0"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="0,0,10,0">
+                    <Button x:Name="ConfigButton" 
+                           Content="⚙" 
+                           FontSize="16"
+                           Background="Transparent"
+                           Foreground="#CCCCCC"
+                           BorderThickness="0"
+                           Padding="8,0"
+                           ToolTip="Configure Paths"
+                           Click="ConfigButton_Click"/>
+                    <Button x:Name="ClearButton" 
+                           Content="🗑" 
+                           FontSize="14"
+                           Background="Transparent"
+                           Foreground="#CCCCCC"
+                           BorderThickness="0"
+                           Padding="8,0"
+                           ToolTip="Clear Console"
+                           Click="ClearButton_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Console Output -->
+        <ScrollViewer Grid.Row="1" 
+                     x:Name="OutputScrollViewer"
+                     Style="{StaticResource ConsoleScrollViewer}"
+                     Background="#0A0A0A">
+            <ItemsControl x:Name="ConsoleOutput" Margin="10">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border Margin="0,2" Padding="5,3" CornerRadius="3">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Type}" Value="Command">
+                                            <Setter Property="Background" Value="#1A1A2E"/>
+                                            <Setter Property="BorderBrush" Value="#16213E"/>
+                                            <Setter Property="BorderThickness" Value="1"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Type}" Value="Success">
+                                            <Setter Property="Background" Value="#0F3E0F"/>
+                                            <Setter Property="BorderBrush" Value="#00FF41"/>
+                                            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Type}" Value="Error">
+                                            <Setter Property="Background" Value="#3E0F0F"/>
+                                            <Setter Property="BorderBrush" Value="#FF4141"/>
+                                            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Type}" Value="Info">
+                                            <Setter Property="Background" Value="#0F2E3E"/>
+                                            <Setter Property="BorderBrush" Value="#41A0FF"/>
+                                            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Type}" Value="AI">
+                                            <Setter Property="Background" Value="#2E0F3E"/>
+                                            <Setter Property="BorderBrush" Value="#B041FF"/>
+                                            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <TextBlock Text="{Binding Message}" 
+                                      TextWrapping="Wrap"
+                                      FontFamily="Cascadia Code, Consolas"
+                                      FontSize="12">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="#E0E0E0"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Type}" Value="Command">
+                                                <Setter Property="Foreground" Value="#00FF41"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding Type}" Value="Error">
+                                                <Setter Property="Foreground" Value="#FF6B6B"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding Type}" Value="AI">
+                                                <Setter Property="Foreground" Value="#B8A0FF"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+
+        <!-- Input Area -->
+        <Grid Grid.Row="2">
+            <Grid.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                    <GradientStop Color="#1E1E1E" Offset="0"/>
+                    <GradientStop Color="#252526" Offset="1"/>
+                </LinearGradientBrush>
+            </Grid.Background>
+            <TextBox x:Name="CommandInput" 
+                    Style="{StaticResource ConsoleTextBox}"
+                    VerticalAlignment="Center"
+                    Height="35"
+                    KeyDown="CommandInput_KeyDown"/>
+        </Grid>
+
+        <!-- Status Bar -->
+        <Border Grid.Row="3" Background="#007ACC" BorderBrush="#005A9E" BorderThickness="0,1,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" x:Name="StatusText" 
+                          Style="{StaticResource StatusLabel}"
+                          Text="Ready"
+                          Foreground="White"/>
+
+                <Separator Grid.Column="1" 
+                          Background="#005A9E" 
+                          Width="1" 
+                          Margin="5,3"/>
+
+                <TextBlock Grid.Column="2" x:Name="ModelStatus" 
+                          Style="{StaticResource StatusLabel}"
+                          Text="Model: phi4-mini"
+                          Foreground="White"
+                          HorizontalAlignment="Left"/>
+
+                <TextBlock Grid.Column="3" x:Name="ConnectionStatus" 
+                          Style="{StaticResource StatusLabel}"
+                          Text="● Connected"
+                          Foreground="#00FF41"
+                          FontWeight="Bold"/>
+            </Grid>
+        </Border>
     </Grid>
 </UserControl>
