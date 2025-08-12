@@ -21,12 +21,14 @@ namespace assistant
 
         public async Task<List<string>> FindFiles(string searchTerm)
         {
+            // Get solution path on UI thread first
+            var solutionPath = await GetSolutionPathAsync();
+
+            if (string.IsNullOrEmpty(solutionPath))
+                return new List<string>();
+
             return await Task.Run(() =>
             {
-                var solutionPath = GetSolutionPath();
-                if (string.IsNullOrEmpty(solutionPath))
-                    return new List<string>();
-
                 var allFiles = Directory.GetFiles(solutionPath, "*.*", SearchOption.AllDirectories)
                     .Where(f => !f.Contains("\\bin\\") &&
                                !f.Contains("\\obj\\") &&
@@ -44,18 +46,20 @@ namespace assistant
 
         public async Task<CreateFileResult> CreateFile(string type, string name)
         {
+            // Get solution path on UI thread first
+            var solutionPath = await GetSolutionPathAsync();
+
+            if (string.IsNullOrEmpty(solutionPath))
+            {
+                return new CreateFileResult
+                {
+                    Success = false,
+                    Message = "No solution is currently open"
+                };
+            }
+
             return await Task.Run(async () =>
             {
-                var solutionPath = GetSolutionPath();
-                if (string.IsNullOrEmpty(solutionPath))
-                {
-                    return new CreateFileResult
-                    {
-                        Success = false,
-                        Message = "No solution is currently open"
-                    };
-                }
-
                 switch (type.ToLower())
                 {
                     case "model":
@@ -288,11 +292,12 @@ namespace assistant
             };
         }
 
-        private string GetSolutionPath()
+        // New async method to get solution path on UI thread
+        private async Task<string> GetSolutionPathAsync()
         {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
+            var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
             if (dte?.Solution?.FullName != null)
             {
                 return Path.GetDirectoryName(dte.Solution.FullName);
