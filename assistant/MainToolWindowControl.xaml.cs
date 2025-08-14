@@ -28,6 +28,7 @@ namespace assistant
         private OllamaService _ollamaService;
         private CommandProcessor _commandProcessor;
         private PathConfiguration _pathConfig;
+        private CodeEditApplicator _editApplicator;
 
         public MainToolWindowControl()
         {
@@ -43,6 +44,7 @@ namespace assistant
             _ollamaService = new OllamaService();
             _pathConfig = PathConfiguration.Load();
             _commandProcessor = new CommandProcessor(_pathConfig);
+            _editApplicator = new CodeEditApplicator(0.90); // 90% similarity threshold
 
             ConsoleOutput.ItemsSource = _messages;
 
@@ -288,27 +290,48 @@ namespace assistant
                 // Get current file context
                 var context = await GetCurrentFileContext();
 
-                // Send to Ollama
-                var response = await _ollamaService.ProcessPrompt(prompt, context);
-
-                if (response.Success)
+                if (context == null)
                 {
-                    AddMessage(response.Message, MessageType.AI);
+                    AddMessage("No active document found. Please open a file to edit.", MessageType.Error);
+                    return;
+                }
 
-                    // Apply code changes if any
-                    if (response.CodeChanges != null && response.CodeChanges.Any())
-                    {
-                        await ApplyCodeChanges(response.CodeChanges);
-                    }
+                // Send to Ollama for code edit processing
+                var editResult = await _ollamaService.ProcessCodeEditRequest(
+                    prompt,
+                    context.Content,
+                    context.FileName
+                );
+
+                if (!editResult.Success)
+                {
+                    AddMessage($"AI Error: {editResult.Error}", MessageType.Error);
+                    return;
+                }
+
+                // Display the summary
+                if (!string.IsNullOrEmpty(editResult.Summary))
+                {
+                    AddMessage($"AI: {editResult.Summary}", MessageType.AI);
+                }
+
+                // Apply the edits if any
+                if (editResult.Edits != null && editResult.Edits.Any())
+                {
+                    await ApplyCodeEdits(context, editResult.Edits);
                 }
                 else
                 {
-                    AddMessage($"AI Error: {response.Message}", MessageType.Error);
+                    AddMessage("No code changes suggested.", MessageType.Info);
                 }
             }
             catch (Exception ex)
             {
                 AddMessage($"AI Error: {ex.Message}", MessageType.Error);
+            }
+            finally
+            {
+                StatusText.Text = "Ready";
             }
         }
 
@@ -356,7 +379,59 @@ namespace assistant
             }
         }
 
-        private async Task ApplyCodeChanges(List<CodeChange> changes)
+        private async Task ApplyCodeEdits(FileContext context, List<CodeEdit> edits)
+        {
+            try
+            {
+                // Apply edits using the CodeEditApplicator
+                var applyResult = _editApplicator.ApplyEdits(context.Content, edits);
+
+                if (!applyResult.Success)
+                {
+                    AddMessage($"Failed to apply edits: {applyResult.Message}", MessageType.Error);
+                    return;
+                }
+
+                // Update the document with the modified content
+                await UpdateDocumentContent(applyResult.ModifiedContent);
+
+                // Display results
+                AddMessage("✓ Code changes applied successfully:", MessageType.Success);
+
+                foreach (var appliedEdit in applyResult.AppliedEdits)
+                {
+                    if (appliedEdit.Success)
+                    {
+                        var similarityInfo = appliedEdit.MatchSimilarity < 1.0
+                            ? $" (match: {appliedEdit.MatchSimilarity:P0})"
+                            : "";
+                        AddMessage($"  • {appliedEdit.Edit.Type}: {appliedEdit.Edit.Reason}{similarityInfo}",
+                                 MessageType.Success);
+                    }
+                    else
+                    {
+                        AddMessage($"  ✗ Failed: {appliedEdit.Edit.Reason} - {appliedEdit.Message}",
+                                 MessageType.Error);
+                    }
+                }
+
+                // Show summary
+                var successCount = applyResult.AppliedEdits.Count(e => e.Success);
+                var totalCount = applyResult.AppliedEdits.Count;
+
+                if (successCount < totalCount)
+                {
+                    AddMessage($"\nSummary: {successCount}/{totalCount} edits applied successfully",
+                             MessageType.Info);
+                }
+            }
+            catch (Exception ex)
+            {
+                AddMessage($"Error applying code edits: {ex.Message}", MessageType.Error);
+            }
+        }
+
+        private async Task UpdateDocumentContent(string newContent)
         {
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
@@ -366,19 +441,9 @@ namespace assistant
                 var textDoc = dte.ActiveDocument.Object("TextDocument") as TextDocument;
                 if (textDoc != null)
                 {
-                    foreach (var change in changes.OrderByDescending(c => c.StartLine))
-                    {
-                        var startPoint = textDoc.CreateEditPoint();
-                        startPoint.MoveToLineAndOffset(change.StartLine, 1);
-
-                        var endPoint = textDoc.CreateEditPoint();
-                        endPoint.MoveToLineAndOffset(change.EndLine + 1, 1);
-
-                        startPoint.Delete(endPoint);
-                        startPoint.Insert(change.NewContent + Environment.NewLine);
-                    }
-
-                    AddMessage($"Applied {changes.Count} code changes", MessageType.Success);
+                    var editPoint = textDoc.CreateEditPoint(textDoc.StartPoint);
+                    editPoint.Delete(textDoc.EndPoint);
+                    editPoint.Insert(newContent);
                 }
             }
         }
@@ -474,4 +539,15 @@ namespace assistant
         Info,
         AI
     }
+
+    // Supporting classes for file context
+    public class FileContext
+    {
+        public string FilePath { get; set; }
+        public string FileName { get; set; }
+        public string Content { get; set; }
+        public string Language { get; set; }
+    }
+
+    // Remove old CodeChange class as it's no longer needed
 }
