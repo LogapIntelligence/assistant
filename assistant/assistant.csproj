@@ -45,8 +45,8 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="CodeEditApplicator.cs" />
     <Compile Include="CommandProcessor.cs" />
+    <Compile Include="ContextManager.cs" />
     <Compile Include="MainToolWindow.cs" />
     <Compile Include="MainToolWindowCommand.cs" />
     <Compile Include="MainToolWindowControl.xaml.cs">

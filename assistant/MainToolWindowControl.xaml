@@ -1,4 +1,5 @@
-﻿<UserControl x:Class="assistant.MainToolWindowControl"
+﻿<!-- This is the updated XAML file for MainToolWindowControl.xaml -->
+<UserControl x:Class="assistant.MainToolWindowControl"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -62,11 +63,43 @@
             <Setter Property="FontSize" Value="11"/>
             <Setter Property="Margin" Value="5,2"/>
         </Style>
+
+        <Style x:Key="ContextItemStyle" TargetType="Border">
+            <Setter Property="Background" Value="#252526"/>
+            <Setter Property="BorderBrush" Value="#3F3F46"/>
+            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+            <Setter Property="Padding" Value="5,3"/>
+            <Setter Property="Margin" Value="0,1"/>
+        </Style>
+
+        <Style x:Key="RemoveButton" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#808080"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="4,0"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Foreground" Value="#FF4141"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
     </UserControl.Resources>
 
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="30"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="50"/>
             <RowDefinition Height="25"/>
@@ -86,6 +119,12 @@
                           VerticalAlignment="Center"
                           Margin="10,0"/>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="0,0,10,0">
+                    <TextBlock x:Name="ContextCountText" 
+                              Text="Context Files: 0"
+                              Foreground="#569CD6"
+                              VerticalAlignment="Center"
+                              Margin="0,0,10,0"
+                              FontSize="11"/>
                     <Button x:Name="ConfigButton" 
                            Content="⚙" 
                            FontSize="16"
@@ -108,8 +147,72 @@
             </Grid>
         </Border>
 
+        <!-- Context Panel -->
+        <Border Grid.Row="1" x:Name="ContextPanel" 
+                Background="#2D2D30" 
+                BorderBrush="#3F3F46" 
+                BorderThickness="0,0,0,1"
+                Visibility="Collapsed">
+            <Grid Margin="10,5">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- Primary File -->
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Primary File: " 
+                              Foreground="#00FF41"
+                              FontWeight="Bold"
+                              Margin="0,0,5,0"/>
+                    <TextBlock Grid.Column="1" x:Name="PrimaryFileText" 
+                              Text="None"
+                              Foreground="#B8A0FF"/>
+                    <Button Grid.Column="2" 
+                           x:Name="ClearPrimaryButton"
+                           Content="✕"
+                           Style="{StaticResource RemoveButton}"
+                           Click="ClearPrimaryButton_Click"
+                           ToolTip="Clear primary file"/>
+                </Grid>
+
+                <!-- Context Files List -->
+                <ItemsControl Grid.Row="1" x:Name="ContextList" Margin="0,5,0,0">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Style="{StaticResource ContextItemStyle}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="📄" Margin="0,0,5,0" Foreground="#569CD6"/>
+                                    <TextBlock Grid.Column="1" 
+                                              Text="{Binding FileName}" 
+                                              Foreground="#CCCCCC"
+                                              FontSize="11"/>
+                                    <Button Grid.Column="2" 
+                                           Content="✕"
+                                           Style="{StaticResource RemoveButton}"
+                                           Tag="{Binding FileName}"
+                                           Click="RemoveContextButton_Click"
+                                           ToolTip="Remove from context"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </Grid>
+        </Border>
+
         <!-- Console Output -->
-        <ScrollViewer Grid.Row="1" 
+        <ScrollViewer Grid.Row="2" 
                      x:Name="OutputScrollViewer"
                      Style="{StaticResource ConsoleScrollViewer}"
                      Background="#0A0A0A">
@@ -176,7 +279,7 @@
         </ScrollViewer>
 
         <!-- Input Area -->
-        <Grid Grid.Row="2">
+        <Grid Grid.Row="3">
             <Grid.Background>
                 <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
                     <GradientStop Color="#1E1E1E" Offset="0"/>
@@ -191,7 +294,7 @@
         </Grid>
 
         <!-- Status Bar -->
-        <Border Grid.Row="3" Background="#007ACC" BorderBrush="#005A9E" BorderThickness="0,1,0,0">
+        <Border Grid.Row="4" Background="#007ACC" BorderBrush="#005A9E" BorderThickness="0,1,0,0">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
@@ -212,7 +315,7 @@
 
                 <TextBlock Grid.Column="2" x:Name="ModelStatus" 
                           Style="{StaticResource StatusLabel}"
-                          Text="Model: phi4-mini"
+                          Text="Model: qwen3-coder"
                           Foreground="White"
                           HorizontalAlignment="Left"/>
 

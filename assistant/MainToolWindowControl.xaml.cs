@@ -9,11 +9,10 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Text.RegularExpressions;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Forms;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -28,7 +27,9 @@ namespace assistant
         private OllamaService _ollamaService;
         private CommandProcessor _commandProcessor;
         private PathConfiguration _pathConfig;
-        // CodeEditApplicator is no longer needed for complete replacement
+        private ContextManager _contextManager;
+        private StringBuilder _streamingCodeBuffer;
+        private bool _isStreaming;
 
         public MainToolWindowControl()
         {
@@ -44,15 +45,43 @@ namespace assistant
             _ollamaService = new OllamaService();
             _pathConfig = PathConfiguration.Load();
             _commandProcessor = new CommandProcessor(_pathConfig);
-            // No need to initialize CodeEditApplicator anymore
+            _contextManager = new ContextManager();
+            _streamingCodeBuffer = new StringBuilder();
 
             ConsoleOutput.ItemsSource = _messages;
+
+            // Bind context manager events
+            _contextManager.StatusMessage += (s, msg) => AddMessage(msg, MessageType.Info);
+            _contextManager.PropertyChanged += ContextManager_PropertyChanged;
+
+            // Bind context UI
+            ContextList.ItemsSource = _contextManager.ContextFiles;
+            UpdateContextDisplay();
 
             AddMessage("AI Assistant Console Initialized", MessageType.Success);
             AddMessage("Type 'help' for available commands", MessageType.Info);
 
             // Check Ollama connection
             _ = CheckOllamaConnection();
+        }
+
+        private void ContextManager_PropertyChanged(object sender, PropertyChangedEventArgs e)
+        {
+            Dispatcher.Invoke(() => UpdateContextDisplay());
+        }
+
+        private void UpdateContextDisplay()
+        {
+            // Update primary file display
+            PrimaryFileText.Text = _contextManager.PrimaryFileName;
+
+            // Update context count
+            ContextCountText.Text = $"Context Files: {_contextManager.ContextFileCount}";
+
+            // Show/hide context panel based on whether there's context
+            ContextPanel.Visibility = (_contextManager.HasPrimaryFile || _contextManager.HasContext)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
         }
 
         private async Task CheckOllamaConnection()
@@ -74,6 +103,16 @@ namespace assistant
 
         private void CommandInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
+            if (_isStreaming)
+            {
+                if (e.Key == Key.Escape)
+                {
+                    _isStreaming = false;
+                    AddMessage("Streaming cancelled", MessageType.Info);
+                }
+                return; // Ignore other input while streaming
+            }
+
             if (e.Key == Key.Enter)
             {
                 ProcessCommand();
@@ -126,7 +165,7 @@ namespace assistant
                     if (selection > 0 && selection <= _commandProcessor.PendingFileSelection.Count)
                     {
                         var selectedFile = _commandProcessor.PendingFileSelection[selection - 1];
-                        await OpenFileInEditor(selectedFile);
+                        await _contextManager.OpenFileInEditor(selectedFile);
                         AddMessage($"Opened: {Path.GetFileName(selectedFile)}", MessageType.Success);
                         _commandProcessor.PendingFileSelection = null;
                     }
@@ -147,7 +186,34 @@ namespace assistant
                         break;
 
                     case "goto":
+                    case "gogo":
                         await GotoFile(parts.Skip(1).ToArray());
+                        break;
+
+                    case "back":
+                        await GoBack();
+                        break;
+
+                    case "add":
+                        await AddToContext();
+                        break;
+
+                    case "setprimary":
+                    case "primary":
+                        await SetPrimary();
+                        break;
+
+                    case "remove":
+                        RemoveFromContext(parts.Skip(1).ToArray());
+                        break;
+
+                    case "clearcontext":
+                    case "clear-context":
+                        ClearContext();
+                        break;
+
+                    case "context":
+                        ShowContext();
                         break;
 
                     case "make":
@@ -189,18 +255,33 @@ namespace assistant
         private void ShowHelp()
         {
             AddMessage("Available Commands:", MessageType.Info);
-            AddMessage("  goto <filename>     - Navigate to file", MessageType.Info);
-            AddMessage("  make model <name>   - Create a model file", MessageType.Info);
-            AddMessage("  make controller <name> - Create a controller", MessageType.Info);
-            AddMessage("  make view <name>    - Create a view", MessageType.Info);
-            AddMessage("  make service <name> - Create a service", MessageType.Info);
-            AddMessage("  make hub <name>     - Create a SignalR hub", MessageType.Info);
-            AddMessage("  make middleware <name> - Create middleware", MessageType.Info);
-            AddMessage("  make all <name>     - Create complete MVC set", MessageType.Info);
-            AddMessage("  config              - Show/edit configuration", MessageType.Info);
-            AddMessage("  clear               - Clear console", MessageType.Info);
-            AddMessage("  ai/prompt <text>    - Send prompt to AI", MessageType.Info);
-            AddMessage("\nOr just type any text to send to AI assistant", MessageType.Info);
+            AddMessage("  Navigation:", MessageType.Info);
+            AddMessage("    goto/gogo <filename> - Navigate to file", MessageType.Info);
+            AddMessage("    back                 - Go back to previous file", MessageType.Info);
+            AddMessage("", MessageType.Info);
+            AddMessage("  Context Management:", MessageType.Info);
+            AddMessage("    add                  - Add current file to context", MessageType.Info);
+            AddMessage("    primary/setprimary   - Set current file as primary", MessageType.Info);
+            AddMessage("    remove <filename>    - Remove file from context", MessageType.Info);
+            AddMessage("    clearcontext         - Clear all context files", MessageType.Info);
+            AddMessage("    context              - Show current context", MessageType.Info);
+            AddMessage("", MessageType.Info);
+            AddMessage("  File Creation:", MessageType.Info);
+            AddMessage("    make model <name>    - Create a model file", MessageType.Info);
+            AddMessage("    make controller <name> - Create a controller", MessageType.Info);
+            AddMessage("    make view <name>     - Create a view", MessageType.Info);
+            AddMessage("    make service <name>  - Create a service", MessageType.Info);
+            AddMessage("    make hub <name>      - Create a SignalR hub", MessageType.Info);
+            AddMessage("    make middleware <name> - Create middleware", MessageType.Info);
+            AddMessage("    make all <name>      - Create complete MVC set", MessageType.Info);
+            AddMessage("", MessageType.Info);
+            AddMessage("  Other:", MessageType.Info);
+            AddMessage("    config               - Show/edit configuration", MessageType.Info);
+            AddMessage("    clear                - Clear console", MessageType.Info);
+            AddMessage("    ai/prompt <text>     - Send prompt to AI", MessageType.Info);
+            AddMessage("", MessageType.Info);
+            AddMessage("Or just type any text to send to AI assistant", MessageType.Info);
+            AddMessage("Press ESC while streaming to cancel", MessageType.Info);
         }
 
         private async Task GotoFile(string[] args)
@@ -220,7 +301,7 @@ namespace assistant
             }
             else if (files.Count == 1)
             {
-                await OpenFileInEditor(files[0]);
+                await _contextManager.OpenFileInEditor(files[0]);
                 AddMessage($"Opened: {Path.GetFileName(files[0])}", MessageType.Success);
             }
             else
@@ -231,9 +312,67 @@ namespace assistant
                     AddMessage($"  [{i + 1}] {files[i]}", MessageType.Info);
                 }
                 AddMessage("Type the number to open the file", MessageType.Info);
-                // Store files for selection
                 _commandProcessor.PendingFileSelection = files;
             }
+        }
+
+        private async Task GoBack()
+        {
+            var success = await _contextManager.NavigateBack();
+            if (!success)
+            {
+                AddMessage("No previous file in navigation history", MessageType.Info);
+            }
+        }
+
+        private async Task AddToContext()
+        {
+            var success = await _contextManager.AddCurrentFileToContext();
+            if (success)
+            {
+                UpdateContextDisplay();
+            }
+        }
+
+        private async Task SetPrimary()
+        {
+            var success = await _contextManager.SetCurrentFileAsPrimary();
+            if (success)
+            {
+                UpdateContextDisplay();
+            }
+        }
+
+        private void RemoveFromContext(string[] args)
+        {
+            if (args.Length == 0)
+            {
+                AddMessage("Usage: remove <filename>", MessageType.Error);
+                return;
+            }
+
+            var fileName = string.Join(" ", args);
+            var success = _contextManager.RemoveFromContext(fileName);
+            if (success)
+            {
+                UpdateContextDisplay();
+            }
+            else
+            {
+                AddMessage($"File '{fileName}' not found in context", MessageType.Error);
+            }
+        }
+
+        private void ClearContext()
+        {
+            _contextManager.ClearContext();
+            UpdateContextDisplay();
+        }
+
+        private void ShowContext()
+        {
+            var summary = _contextManager.GetContextSummary();
+            AddMessage(summary, MessageType.Info);
         }
 
         private async Task MakeFile(string[] args)
@@ -254,23 +393,12 @@ namespace assistant
                 AddMessage(result.Message, MessageType.Success);
                 if (!string.IsNullOrEmpty(result.FilePath))
                 {
-                    await OpenFileInEditor(result.FilePath);
+                    await _contextManager.OpenFileInEditor(result.FilePath);
                 }
             }
             else
             {
                 AddMessage(result.Message, MessageType.Error);
-            }
-        }
-
-        private async Task OpenFileInEditor(string filePath)
-        {
-            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-            var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
-            if (dte != null)
-            {
-                dte.ItemOperations.OpenFile(filePath);
             }
         }
 
@@ -282,48 +410,77 @@ namespace assistant
                 return;
             }
 
-            StatusText.Text = "AI Processing...";
-            AddMessage("🤖 Processing your request...", MessageType.AI);
-
-            try
+            // Get primary file or current file
+            var primaryFile = _contextManager.PrimaryFile;
+            if (primaryFile == null)
             {
-                // Get current file context
-                var context = await GetCurrentFileContext();
-
-                if (context == null)
+                primaryFile = await _contextManager.GetCurrentFileContext();
+                if (primaryFile == null)
                 {
                     AddMessage("No active document found. Please open a file to edit.", MessageType.Error);
                     return;
                 }
+            }
 
-                // Send to Ollama for complete file replacement
-                var result = await _ollamaService.ProcessCodeEditRequest(
+            StatusText.Text = "AI Streaming...";
+            _isStreaming = true;
+            _streamingCodeBuffer.Clear();
+
+            AddMessage("🤖 Processing your request...", MessageType.AI);
+
+            try
+            {
+                var contextFiles = _contextManager.ContextFiles.ToList();
+
+                await _ollamaService.StreamCodeCompletion(
                     prompt,
-                    context.Content,
-                    context.FileName
+                    primaryFile,
+                    contextFiles,
+                    onToken: async (token) =>
+                    {
+                        // Buffer the streaming code
+                        _streamingCodeBuffer.Append(token);
+
+                        // Update file content in real-time (throttled)
+                        if (_streamingCodeBuffer.Length % 100 == 0) // Update every 100 chars
+                        {
+                            await UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+                        }
+                    },
+                    onIntro: (intro) =>
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            AddMessage($"AI: {intro}", MessageType.AI);
+                        });
+                    },
+                    onSummary: (summary) =>
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            // Final update with complete content
+                            _ = UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+
+                            AddMessage($"✓ {summary}", MessageType.Success);
+
+                            // Calculate and show diff
+                            var diff = _ollamaService.GetDiffSummary(
+                                primaryFile.Content,
+                                _streamingCodeBuffer.ToString()
+                            );
+
+                            if (diff.LinesAdded > 0 || diff.LinesRemoved > 0 || diff.LinesChanged > 0)
+                            {
+                                var stats = new List<string>();
+                                if (diff.LinesAdded > 0) stats.Add($"+{diff.LinesAdded}");
+                                if (diff.LinesRemoved > 0) stats.Add($"-{diff.LinesRemoved}");
+                                if (diff.LinesChanged > 0) stats.Add($"~{diff.LinesChanged}");
+
+                                AddMessage($"Changes: {string.Join(" ", stats)} lines", MessageType.Info);
+                            }
+                        });
+                    }
                 );
-
-                if (!result.Success)
-                {
-                    AddMessage($"AI Error: {result.Error}", MessageType.Error);
-                    return;
-                }
-
-                // Display the summary
-                if (!string.IsNullOrEmpty(result.Summary))
-                {
-                    AddMessage($"AI: {result.Summary}", MessageType.AI);
-                }
-
-                // Apply the complete file replacement
-                if (!string.IsNullOrEmpty(result.UpdatedContent))
-                {
-                    await ApplyCompleteFileReplacement(context, result);
-                }
-                else
-                {
-                    AddMessage("No changes were made to the file.", MessageType.Info);
-                }
             }
             catch (Exception ex)
             {
@@ -331,97 +488,12 @@ namespace assistant
             }
             finally
             {
+                _isStreaming = false;
                 StatusText.Text = "Ready";
             }
         }
 
-        private async Task<FileContext> GetCurrentFileContext()
-        {
-            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-            var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
-            if (dte?.ActiveDocument != null)
-            {
-                var doc = dte.ActiveDocument;
-                var textDoc = doc.Object("TextDocument") as TextDocument;
-
-                if (textDoc != null)
-                {
-                    var editPoint = textDoc.StartPoint.CreateEditPoint();
-                    var content = editPoint.GetText(textDoc.EndPoint);
-
-                    return new FileContext
-                    {
-                        FilePath = doc.FullName,
-                        FileName = doc.Name,
-                        Content = content,
-                        Language = GetLanguageFromExtension(Path.GetExtension(doc.Name))
-                    };
-                }
-            }
-
-            return null;
-        }
-
-        private string GetLanguageFromExtension(string extension)
-        {
-            switch (extension.ToLower())
-            {
-                case ".cs": return "csharp";
-                case ".js": return "javascript";
-                case ".ts": return "typescript";
-                case ".html": return "html";
-                case ".css": return "css";
-                case ".json": return "json";
-                case ".xml": return "xml";
-                case ".sql": return "sql";
-                default: return "text";
-            }
-        }
-
-        private async Task ApplyCompleteFileReplacement(FileContext context, FileReplacementResult result)
-        {
-            try
-            {
-                // Calculate diff summary for user feedback
-                var diffSummary = _ollamaService.GetDiffSummary(context.Content, result.UpdatedContent);
-
-                // Update the document with the complete new content
-                await UpdateDocumentContent(result.UpdatedContent);
-
-                // Display success message
-                AddMessage("✓ File updated successfully!", MessageType.Success);
-
-                // Display specific changes if provided
-                if (result.Changes != null && result.Changes.Any())
-                {
-                    AddMessage("Changes made:", MessageType.Info);
-                    foreach (var change in result.Changes)
-                    {
-                        AddMessage($"  • {change}", MessageType.Success);
-                    }
-                }
-
-                // Display diff statistics
-                if (diffSummary.LinesAdded > 0 || diffSummary.LinesRemoved > 0 || diffSummary.LinesChanged > 0)
-                {
-                    AddMessage($"\nFile statistics:", MessageType.Info);
-                    if (diffSummary.LinesAdded > 0)
-                        AddMessage($"  • Lines added: {diffSummary.LinesAdded}", MessageType.Info);
-                    if (diffSummary.LinesRemoved > 0)
-                        AddMessage($"  • Lines removed: {diffSummary.LinesRemoved}", MessageType.Info);
-                    if (diffSummary.LinesChanged > 0)
-                        AddMessage($"  • Lines modified: {diffSummary.LinesChanged}", MessageType.Info);
-                    AddMessage($"  • Total lines: {diffSummary.ModifiedLineCount} (was {diffSummary.OriginalLineCount})", MessageType.Info);
-                }
-            }
-            catch (Exception ex)
-            {
-                AddMessage($"Error applying file changes: {ex.Message}", MessageType.Error);
-            }
-        }
-
-        private async Task UpdateDocumentContent(string newContent)
+        private async Task UpdateDocumentContentStreaming(string newContent)
         {
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
@@ -487,6 +559,24 @@ namespace assistant
                 AddMessage("Configuration updated", MessageType.Success);
             }
         }
+
+        private void RemoveContextButton_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as Button;
+            var fileName = button?.Tag as string;
+            if (!string.IsNullOrEmpty(fileName))
+            {
+                _contextManager.RemoveFromContext(fileName);
+                UpdateContextDisplay();
+            }
+        }
+
+        private void ClearPrimaryButton_Click(object sender, RoutedEventArgs e)
+        {
+            _contextManager.PrimaryFile = null;
+            UpdateContextDisplay();
+            AddMessage("Cleared primary file", MessageType.Info);
+        }
     }
 
     public class ConsoleMessage : INotifyPropertyChanged
@@ -528,14 +618,5 @@ namespace assistant
         Error,
         Info,
         AI
-    }
-
-    // Supporting classes for file context
-    public class FileContext
-    {
-        public string FilePath { get; set; }
-        public string FileName { get; set; }
-        public string Content { get; set; }
-        public string Language { get; set; }
     }
 }

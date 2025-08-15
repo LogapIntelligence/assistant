@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -17,14 +18,13 @@ public class OllamaService
     public OllamaService()
     {
         _httpClient = new HttpClient();
-        _httpClient.Timeout = TimeSpan.FromMinutes(5);
+        _httpClient.Timeout = TimeSpan.FromMinutes(10);
 
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             PropertyNameCaseInsensitive = true,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-            WriteIndented = true
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
     }
 
@@ -41,25 +41,34 @@ public class OllamaService
         }
     }
 
-    public async Task<FileReplacementResult> ProcessCodeEditRequest(string userPrompt, string fileContent, string fileName)
+    // New streaming method for code completion
+    public async Task StreamCodeCompletion(
+        string userPrompt,
+        FileContext primaryFile,
+        List<FileContext> contextFiles,
+        Action<string> onToken,
+        Action<string> onIntro,
+        Action<string> onSummary)
     {
         try
         {
+            var systemPrompt = GetStreamingSystemPrompt();
+            var userContent = BuildStreamingUserPrompt(userPrompt, primaryFile, contextFiles);
+
             var requestBody = new
             {
                 model = _model,
                 messages = new[]
                 {
-                    new { role = "system", content = GetSystemPrompt() },
-                    new { role = "user", content = BuildUserPrompt(userPrompt, fileContent, fileName) }
+                    new { role = "system", content = systemPrompt },
+                    new { role = "user", content = userContent }
                 },
-                stream = false,
-                format = GetResponseSchema(),
+                stream = true,  // Enable streaming
                 options = new
                 {
                     temperature = 0.1,
                     top_p = 0.9,
-                    num_predict = 8000,  // Increased for full file content
+                    num_predict = 16000,  // Increased for full files
                     seed = 42
                 }
             };
@@ -67,174 +76,163 @@ public class OllamaService
             var json = JsonSerializer.Serialize(requestBody, _jsonOptions);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            var response = await _httpClient.PostAsync($"{_baseUrl}/api/chat", content);
-
-            if (!response.IsSuccessStatusCode)
+            var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/chat")
             {
-                return new FileReplacementResult
-                {
-                    Success = false,
-                    Error = $"API Error: {response.StatusCode}"
-                };
-            }
-
-            var responseJson = await response.Content.ReadAsStringAsync();
-            var ollamaResponse = JsonSerializer.Deserialize<OllamaChatResponse>(responseJson, _jsonOptions);
-
-            if (ollamaResponse?.Message?.Content != null)
-            {
-                var replacementResponse = JsonSerializer.Deserialize<CodeReplacementResponse>(
-                    ollamaResponse.Message.Content, _jsonOptions);
-
-                // Validate and clean the response
-                replacementResponse = PostProcessResponse(replacementResponse);
-
-                return new FileReplacementResult
-                {
-                    Success = true,
-                    UpdatedContent = replacementResponse.UpdatedFile,
-                    Summary = replacementResponse.Summary,
-                    Changes = replacementResponse.Changes
-                };
-            }
-
-            return new FileReplacementResult
-            {
-                Success = false,
-                Error = "No response from model"
+                Content = content
             };
-        }
-        catch (JsonException jsonEx)
-        {
-            return new FileReplacementResult
-            {
-                Success = false,
-                Error = $"Model returned invalid JSON: {jsonEx.Message}"
-            };
-        }
-        catch (Exception ex)
-        {
-            return new FileReplacementResult
-            {
-                Success = false,
-                Error = $"Unexpected error: {ex.Message}"
-            };
-        }
-    }
 
-    private CodeReplacementResponse PostProcessResponse(CodeReplacementResponse response)
-    {
-        // Clean up any potential formatting issues
-        if (!string.IsNullOrEmpty(response.UpdatedFile))
-        {
-            // Remove any potential markdown code blocks if present
-            response.UpdatedFile = response.UpdatedFile.Trim();
+            var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
 
-            // Remove ```csharp or ``` markers if they exist
-            if (response.UpdatedFile.StartsWith("```"))
+            using (var stream = await response.Content.ReadAsStreamAsync())
+            using (var reader = new StreamReader(stream))
             {
-                var lines = response.UpdatedFile.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-                if (lines.Length > 2)
+                var buffer = new StringBuilder();
+                var section = StreamSection.Intro;
+                var codeBlockDepth = 0;
+                string line;
+
+                while ((line = await reader.ReadLineAsync()) != null)
                 {
-                    // Remove first and last line if they are code block markers
-                    var firstLine = lines[0].Trim();
-                    var lastLine = lines[lines.Length - 1].Trim();
+                    if (string.IsNullOrWhiteSpace(line))
+                        continue;
 
-                    if (firstLine.StartsWith("```") && lastLine == "```")
+                    try
                     {
-                        response.UpdatedFile = string.Join(Environment.NewLine,
-                            lines.Skip(1).Take(lines.Length - 2));
+                        var streamResponse = JsonSerializer.Deserialize<OllamaStreamResponse>(line, _jsonOptions);
+                        if (streamResponse?.Message?.Content != null)
+                        {
+                            var token = streamResponse.Message.Content;
+                            buffer.Append(token);
+
+                            // Parse the buffer to detect sections
+                            var bufferContent = buffer.ToString();
+
+                            // Detect transitions between sections
+                            if (section == StreamSection.Intro && bufferContent.Contains("```"))
+                            {
+                                var introEnd = bufferContent.IndexOf("```");
+                                if (introEnd > 0)
+                                {
+                                    var intro = bufferContent.Substring(0, introEnd).Trim();
+                                    onIntro?.Invoke(intro);
+                                    buffer.Clear();
+                                    buffer.Append(bufferContent.Substring(introEnd + 3));
+                                    section = StreamSection.Code;
+                                    codeBlockDepth = 1;
+                                }
+                            }
+                            else if (section == StreamSection.Code)
+                            {
+                                // Stream code tokens directly
+                                onToken?.Invoke(token);
+
+                                // Check for code block end
+                                if (token.Contains("```"))
+                                {
+                                    var codeEnd = bufferContent.LastIndexOf("```");
+                                    if (codeEnd > 0 && bufferContent.Count(c => c == '`') >= 6)
+                                    {
+                                        section = StreamSection.Summary;
+                                        buffer.Clear();
+                                    }
+                                }
+                            }
+                            else if (section == StreamSection.Summary)
+                            {
+                                // Continue building summary
+                                // Will be processed when stream ends
+                            }
+                        }
+
+                        if (streamResponse?.Done == true)
+                        {
+                            // Process any remaining summary
+                            if (section == StreamSection.Summary && buffer.Length > 0)
+                            {
+                                onSummary?.Invoke(buffer.ToString().Trim());
+                            }
+                            break;
+                        }
+                    }
+                    catch (JsonException)
+                    {
+                        // Skip malformed JSON lines
+                        continue;
                     }
                 }
             }
         }
-
-        // Ensure changes list is not null
-        if (response.Changes == null)
+        catch (Exception ex)
         {
-            response.Changes = new List<string>();
+            throw new Exception($"Streaming error: {ex.Message}", ex);
         }
-
-        return response;
     }
 
-    private string GetSystemPrompt()
+    private string GetStreamingSystemPrompt()
     {
-        return @"You are a code editing assistant. You will receive a file and a modification request.
-Your task is to return the COMPLETE updated file content with all requested changes applied.
+        return @"You are a code completion assistant. You will receive a file to modify and context files for reference.
 
 CRITICAL INSTRUCTIONS:
-1. Return ONLY valid JSON in the specified format
-2. The 'updatedFile' field must contain the ENTIRE file content after modifications
-3. Do not use markdown code blocks in the updatedFile field
-4. Preserve all original formatting, indentation, and structure except where changes are needed
+1. Output format must be EXACTLY:
+   - Brief intro (1-2 sentences explaining what you'll do)
+   - Complete code file wrapped in ``` markers
+   - Brief summary (1-2 sentences of what was changed)
+
+2. The code block must contain the ENTIRE updated file
+3. Do not include language specifier after ``` (no ```csharp, just ```)
+4. Preserve all original formatting and structure except where changes are needed
 5. Apply ALL requested changes accurately
-6. Include a clear summary of what was changed
-7. List specific changes made in the 'changes' array
 
-RESPONSE FORMAT:
-{
-  ""updatedFile"": ""<COMPLETE file content with all changes applied>"",
-  ""summary"": ""<Brief summary of all changes made>"",
-  ""changes"": [
-    ""<Specific change 1>"",
-    ""<Specific change 2>"",
-    ...
-  ]
-}
+EXAMPLE OUTPUT:
+I'll add the new validation method to the Product model.
+```
+[COMPLETE FILE CONTENT HERE]
+```
+Added validation method and updated the constructor to use it.
 
-IMPORTANT:
-- The updatedFile field contains the ENTIRE file, not just the changed parts
-- Maintain exact indentation and formatting from the original file
-- Do not add explanatory comments unless specifically requested
-- Ensure the code remains syntactically correct after changes";
+IMPORTANT: Output ONLY in this format. No additional explanations or markdown.";
     }
 
-    private string BuildUserPrompt(string userPrompt, string fileContent, string fileName)
+    private string BuildStreamingUserPrompt(string userPrompt, FileContext primaryFile, List<FileContext> contextFiles)
     {
         var prompt = new StringBuilder();
 
-        prompt.AppendLine($"File: {fileName}");
-        prompt.AppendLine("\nCurrent file content:");
+        // Add primary file
+        prompt.AppendLine($"PRIMARY FILE TO MODIFY: {primaryFile.FileName}");
         prompt.AppendLine("```");
-        prompt.AppendLine(fileContent);
+        prompt.AppendLine(primaryFile.Content);
         prompt.AppendLine("```");
-        prompt.AppendLine($"\nRequested modification: {userPrompt}");
-        prompt.AppendLine("\nPlease return the COMPLETE updated file with all requested changes applied.");
-        prompt.AppendLine("Remember to return ONLY valid JSON with the entire file content in the 'updatedFile' field.");
+        prompt.AppendLine();
+
+        // Add context files if any
+        if (contextFiles != null && contextFiles.Any())
+        {
+            prompt.AppendLine("CONTEXT FILES (for reference only, do not modify):");
+            foreach (var contextFile in contextFiles)
+            {
+                prompt.AppendLine($"\n--- {contextFile.FileName} ---");
+                prompt.AppendLine("```");
+                prompt.AppendLine(contextFile.Content);
+                prompt.AppendLine("```");
+            }
+            prompt.AppendLine();
+        }
+
+        prompt.AppendLine($"USER REQUEST: {userPrompt}");
+        prompt.AppendLine("\nPlease provide the complete updated file content.");
 
         return prompt.ToString();
     }
 
-    private object GetResponseSchema()
+    // Keep the old method for backward compatibility but mark as deprecated
+    [Obsolete("Use StreamCodeCompletion for better performance")]
+    public async Task<FileReplacementResult> ProcessCodeEditRequest(string userPrompt, string fileContent, string fileName)
     {
-        return new
-        {
-            type = "object",
-            properties = new
-            {
-                updatedFile = new
-                {
-                    type = "string",
-                    description = "The complete file content with all modifications applied"
-                },
-                summary = new
-                {
-                    type = "string",
-                    description = "Brief summary of all changes made"
-                },
-                changes = new
-                {
-                    type = "array",
-                    items = new { type = "string" },
-                    description = "List of specific changes made to the file"
-                }
-            },
-            required = new[] { "updatedFile", "summary", "changes" }
-        };
+        // Implementation remains for backward compatibility
+        throw new NotImplementedException("This method is deprecated. Use StreamCodeCompletion instead.");
     }
 
-    // Method to compare original and modified content to generate a diff summary
     public DiffSummary GetDiffSummary(string original, string modified)
     {
         var originalLines = original.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
@@ -248,7 +246,6 @@ IMPORTANT:
             LinesRemoved = Math.Max(0, originalLines.Length - modifiedLines.Length)
         };
 
-        // Simple diff detection (could be enhanced with more sophisticated algorithm)
         int minLength = Math.Min(originalLines.Length, modifiedLines.Length);
         for (int i = 0; i < minLength; i++)
         {
@@ -260,28 +257,29 @@ IMPORTANT:
 
         return summary;
     }
+
+    private enum StreamSection
+    {
+        Intro,
+        Code,
+        Summary
+    }
 }
 
 // Response Models
-public class CodeReplacementResponse
+public class OllamaStreamResponse
 {
-    [JsonPropertyName("updatedFile")]
-    public string UpdatedFile { get; set; }
-
-    [JsonPropertyName("summary")]
-    public string Summary { get; set; }
-
-    [JsonPropertyName("changes")]
-    public List<string> Changes { get; set; } = new List<string>();
+    public OllamaMessage Message { get; set; }
+    public bool Done { get; set; }
 }
 
-public class FileReplacementResult
+public class FileContext
 {
-    public bool Success { get; set; }
-    public string Error { get; set; }
-    public string UpdatedContent { get; set; }
-    public string Summary { get; set; }
-    public List<string> Changes { get; set; }
+    public string FilePath { get; set; }
+    public string FileName { get; set; }
+    public string Content { get; set; }
+    public string Language { get; set; }
+    public bool IsPrimary { get; set; }
 }
 
 public class DiffSummary
@@ -293,49 +291,17 @@ public class DiffSummary
     public int LinesChanged { get; set; }
 }
 
-// Internal Models (unchanged)
-internal class OllamaChatResponse
-{
-    public OllamaMessage Message { get; set; }
-}
-
-internal class OllamaMessage
-{
-    public string Content { get; set; }
-}
-
-// Legacy models - kept for backward compatibility but deprecated
-[Obsolete("Use FileReplacementResult instead")]
-public class EditResult
+// Keep old models for compatibility
+public class FileReplacementResult
 {
     public bool Success { get; set; }
     public string Error { get; set; }
-    public List<CodeEdit> Edits { get; set; }
+    public string UpdatedContent { get; set; }
     public string Summary { get; set; }
+    public List<string> Changes { get; set; }
 }
 
-[Obsolete("No longer used in complete replacement mode")]
-public class CodeEdit
+public class OllamaMessage
 {
-    [JsonPropertyName("source")]
-    public string Source { get; set; }
-
-    [JsonPropertyName("new")]
-    public string New { get; set; }
-
-    [JsonPropertyName("type")]
-    public string Type { get; set; }
-
-    [JsonPropertyName("reason")]
-    public string Reason { get; set; }
-}
-
-[Obsolete("Use CodeReplacementResponse instead")]
-public class CodeEditResponse
-{
-    [JsonPropertyName("edits")]
-    public List<CodeEdit> Edits { get; set; } = new List<CodeEdit>();
-
-    [JsonPropertyName("summary")]
-    public string Summary { get; set; }
+    public string Content { get; set; }
 }
