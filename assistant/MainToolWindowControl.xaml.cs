@@ -10,6 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -99,32 +100,6 @@ namespace assistant
                     AddMessage("⚠ Ollama is not running. Please start Ollama for AI features.", MessageType.Error);
                 }
             });
-        }
-
-        private void CommandInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (_isStreaming)
-            {
-                if (e.Key == Key.Escape)
-                {
-                    _isStreaming = false;
-                    AddMessage("Streaming cancelled", MessageType.Info);
-                }
-                return; // Ignore other input while streaming
-            }
-
-            if (e.Key == Key.Enter)
-            {
-                ProcessCommand();
-            }
-            else if (e.Key == Key.Up)
-            {
-                NavigateHistory(-1);
-            }
-            else if (e.Key == Key.Down)
-            {
-                NavigateHistory(1);
-            }
         }
 
         private void NavigateHistory(int direction)
@@ -426,40 +401,77 @@ namespace assistant
             _isStreaming = true;
             _streamingCodeBuffer.Clear();
 
+            // Create cancellation token for ESC key handling
+            var cts = new CancellationTokenSource();
+
+            // Store the CTS so we can cancel it on ESC
+            _currentStreamingCts = cts;
+
             AddMessage("🤖 Processing your request...", MessageType.AI);
 
             try
             {
                 var contextFiles = _contextManager.ContextFiles.ToList();
 
+                // Variables to track streaming state
+                string lastContent = "";
+                DateTime lastUpdate = DateTime.Now;
+                bool hasReceivedContent = false;
+
                 await _ollamaService.StreamCodeCompletion(
                     prompt,
                     primaryFile,
                     contextFiles,
-                    onToken: async (token) =>
+                    onToken: async (completeCode) =>
                     {
-                        // Buffer the streaming code
-                        _streamingCodeBuffer.Append(token);
+                        // This now receives the complete code, not individual tokens
+                        if (string.IsNullOrEmpty(completeCode))
+                            return;
 
-                        // Update file content in real-time (throttled)
-                        if (_streamingCodeBuffer.Length % 100 == 0) // Update every 100 chars
+                        hasReceivedContent = true;
+
+                        // Throttle updates to every 100ms for smoother experience
+                        if ((DateTime.Now - lastUpdate).TotalMilliseconds >= 100 ||
+                            completeCode.Length > lastContent.Length + 500) // Or if significant content added
                         {
-                            await UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+                            lastContent = completeCode;
+                            lastUpdate = DateTime.Now;
+
+                            await Dispatcher.InvokeAsync(async () =>
+                            {
+                                if (!cts.Token.IsCancellationRequested)
+                                {
+                                    await UpdateDocumentContentStreaming(completeCode);
+                                }
+                            });
                         }
+
+                        // Store in buffer for final update
+                        _streamingCodeBuffer.Clear();
+                        _streamingCodeBuffer.Append(completeCode);
                     },
                     onIntro: (intro) =>
                     {
                         Dispatcher.Invoke(() =>
                         {
-                            AddMessage($"AI: {intro}", MessageType.AI);
+                            if (!cts.Token.IsCancellationRequested)
+                            {
+                                AddMessage($"AI: {intro}", MessageType.AI);
+                            }
                         });
                     },
                     onSummary: (summary) =>
                     {
-                        Dispatcher.Invoke(() =>
+                        Dispatcher.Invoke(async () =>
                         {
-                            // Final update with complete content
-                            _ = UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+                            if (cts.Token.IsCancellationRequested)
+                                return;
+
+                            // Final update with complete content to ensure nothing is missed
+                            if (_streamingCodeBuffer.Length > 0)
+                            {
+                                await UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+                            }
 
                             AddMessage($"✓ {summary}", MessageType.Success);
 
@@ -479,8 +491,23 @@ namespace assistant
                                 AddMessage($"Changes: {string.Join(" ", stats)} lines", MessageType.Info);
                             }
                         });
-                    }
+                    },
+                    cancellationToken: cts.Token
                 );
+
+                // Ensure final content is applied if we haven't received a summary
+                if (hasReceivedContent && _streamingCodeBuffer.Length > 0)
+                {
+                    await Dispatcher.InvokeAsync(async () =>
+                    {
+                        await UpdateDocumentContentStreaming(_streamingCodeBuffer.ToString());
+                        AddMessage("✓ Code updated successfully", MessageType.Success);
+                    });
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                AddMessage("Streaming cancelled by user", MessageType.Info);
             }
             catch (Exception ex)
             {
@@ -489,24 +516,94 @@ namespace assistant
             finally
             {
                 _isStreaming = false;
+                _currentStreamingCts = null;
                 StatusText.Text = "Ready";
             }
         }
 
         private async Task UpdateDocumentContentStreaming(string newContent)
         {
-            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-            var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
-            if (dte?.ActiveDocument != null)
+            try
             {
-                var textDoc = dte.ActiveDocument.Object("TextDocument") as TextDocument;
-                if (textDoc != null)
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var dte = Package.GetGlobalService(typeof(DTE)) as DTE2;
+                if (dte?.ActiveDocument != null)
                 {
-                    var editPoint = textDoc.CreateEditPoint(textDoc.StartPoint);
-                    editPoint.Delete(textDoc.EndPoint);
-                    editPoint.Insert(newContent);
+                    var textDoc = dte.ActiveDocument.Object("TextDocument") as TextDocument;
+                    if (textDoc != null)
+                    {
+                        // Store cursor position
+                        var selection = textDoc.Selection;
+                        int line = selection.ActivePoint.Line;
+                        int column = selection.ActivePoint.LineCharOffset;
+
+                        // Update content
+                        var editPoint = textDoc.CreateEditPoint(textDoc.StartPoint);
+                        editPoint.Delete(textDoc.EndPoint);
+                        editPoint.Insert(newContent);
+
+                        // Try to restore cursor position (within bounds)
+                        try
+                        {
+                            var newEndPoint = textDoc.EndPoint;
+                            if (line <= newEndPoint.Line)
+                            {
+                                var targetLine = Math.Min(line, newEndPoint.Line);
+                                selection.MoveToLineAndOffset(targetLine, 1);
+
+                                // Try to restore column if possible
+                                var lineLength = selection.ActivePoint.LineLength;
+                                if (column <= lineLength)
+                                {
+                                    selection.MoveToLineAndOffset(targetLine, column);
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // If restoration fails, just leave cursor where it is
+                        }
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    AddMessage($"Error updating document: {ex.Message}", MessageType.Error);
+                });
+            }
+        }
+
+        // Add this field to the class
+        private CancellationTokenSource _currentStreamingCts;
+
+        // Update the CommandInput_KeyDown method to handle ESC better
+        private void CommandInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (_isStreaming)
+            {
+                if (e.Key == Key.Escape)
+                {
+                    _currentStreamingCts?.Cancel();
+                    _isStreaming = false;
+                    AddMessage("Cancelling stream...", MessageType.Info);
+                }
+                return; // Ignore other input while streaming
+            }
+
+            if (e.Key == Key.Enter)
+            {
+                ProcessCommand();
+            }
+            else if (e.Key == Key.Up)
+            {
+                NavigateHistory(-1);
+            }
+            else if (e.Key == Key.Down)
+            {
+                NavigateHistory(1);
             }
         }
 

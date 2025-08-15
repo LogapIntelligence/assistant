@@ -6,7 +6,10 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Timers;
 
 public class OllamaService
 {
@@ -14,6 +17,9 @@ public class OllamaService
     private readonly string _baseUrl = "http://localhost:11434";
     private readonly string _model = "qwen3-coder";
     private readonly JsonSerializerOptions _jsonOptions;
+    private System.Timers.Timer _updateTimer;
+    private string _pendingContent;
+    private readonly object _contentLock = new object();
 
     public OllamaService()
     {
@@ -41,14 +47,15 @@ public class OllamaService
         }
     }
 
-    // New streaming method for code completion
+    // Improved streaming method with better parsing and smoother updates
     public async Task StreamCodeCompletion(
         string userPrompt,
         FileContext primaryFile,
         List<FileContext> contextFiles,
         Action<string> onToken,
         Action<string> onIntro,
-        Action<string> onSummary)
+        Action<string> onSummary,
+        CancellationToken cancellationToken = default)
     {
         try
         {
@@ -63,12 +70,12 @@ public class OllamaService
                     new { role = "system", content = systemPrompt },
                     new { role = "user", content = userContent }
                 },
-                stream = true,  // Enable streaming
+                stream = true,
                 options = new
                 {
                     temperature = 0.1,
                     top_p = 0.9,
-                    num_predict = 16000,  // Increased for full files
+                    num_predict = 16000,
                     seed = 42
                 }
             };
@@ -81,19 +88,45 @@ public class OllamaService
                 Content = content
             };
 
-            var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             response.EnsureSuccessStatusCode();
+
+            // Setup timer for smooth updates (every 50ms)
+            _updateTimer = new System.Timers.Timer(50);
+            bool updatePending = false;
+            string lastUpdate = "";
+
+            _updateTimer.Elapsed += (sender, e) =>
+            {
+                lock (_contentLock)
+                {
+                    if (!string.IsNullOrEmpty(_pendingContent) && _pendingContent != lastUpdate)
+                    {
+                        onToken?.Invoke(_pendingContent);
+                        lastUpdate = _pendingContent;
+                    }
+                }
+            };
 
             using (var stream = await response.Content.ReadAsStreamAsync())
             using (var reader = new StreamReader(stream))
             {
-                var buffer = new StringBuilder();
-                var section = StreamSection.Intro;
-                var codeBlockDepth = 0;
-                string line;
+                var fullBuffer = new StringBuilder();
+                var codeBuffer = new StringBuilder();
+                var currentSection = StreamSection.Intro;
+                bool inCodeBlock = false;
+                int codeBlockCount = 0;
+                string introText = "";
+                string summaryText = "";
 
+                _updateTimer.Start();
+
+                string line;
                 while ((line = await reader.ReadLineAsync()) != null)
                 {
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
@@ -103,54 +136,62 @@ public class OllamaService
                         if (streamResponse?.Message?.Content != null)
                         {
                             var token = streamResponse.Message.Content;
-                            buffer.Append(token);
+                            fullBuffer.Append(token);
 
-                            // Parse the buffer to detect sections
-                            var bufferContent = buffer.ToString();
+                            // Process the full buffer to detect sections
+                            var fullText = fullBuffer.ToString();
 
-                            // Detect transitions between sections
-                            if (section == StreamSection.Intro && bufferContent.Contains("```"))
+                            // Parse and handle the response more robustly
+                            ParseStreamContent(
+                                fullText,
+                                ref currentSection,
+                                ref inCodeBlock,
+                                ref codeBlockCount,
+                                ref introText,
+                                ref summaryText,
+                                codeBuffer,
+                                onIntro);
+
+                            // Update pending content for smooth streaming
+                            if (currentSection == StreamSection.Code && inCodeBlock)
                             {
-                                var introEnd = bufferContent.IndexOf("```");
-                                if (introEnd > 0)
+                                lock (_contentLock)
                                 {
-                                    var intro = bufferContent.Substring(0, introEnd).Trim();
-                                    onIntro?.Invoke(intro);
-                                    buffer.Clear();
-                                    buffer.Append(bufferContent.Substring(introEnd + 3));
-                                    section = StreamSection.Code;
-                                    codeBlockDepth = 1;
+                                    _pendingContent = CleanCodeContent(codeBuffer.ToString());
                                 }
-                            }
-                            else if (section == StreamSection.Code)
-                            {
-                                // Stream code tokens directly
-                                onToken?.Invoke(token);
-
-                                // Check for code block end
-                                if (token.Contains("```"))
-                                {
-                                    var codeEnd = bufferContent.LastIndexOf("```");
-                                    if (codeEnd > 0 && bufferContent.Count(c => c == '`') >= 6)
-                                    {
-                                        section = StreamSection.Summary;
-                                        buffer.Clear();
-                                    }
-                                }
-                            }
-                            else if (section == StreamSection.Summary)
-                            {
-                                // Continue building summary
-                                // Will be processed when stream ends
                             }
                         }
 
                         if (streamResponse?.Done == true)
                         {
-                            // Process any remaining summary
-                            if (section == StreamSection.Summary && buffer.Length > 0)
+                            // Ensure final update
+                            _updateTimer.Stop();
+
+                            // Final update with complete content
+                            if (codeBuffer.Length > 0)
                             {
-                                onSummary?.Invoke(buffer.ToString().Trim());
+                                var finalCode = CleanCodeContent(codeBuffer.ToString());
+                                onToken?.Invoke(finalCode);
+                            }
+
+                            // Extract and send summary if present
+                            if (!string.IsNullOrEmpty(summaryText))
+                            {
+                                onSummary?.Invoke(summaryText.Trim());
+                            }
+                            else if (currentSection == StreamSection.Summary)
+                            {
+                                // Try to extract summary from the end of fullBuffer
+                                var fullText = fullBuffer.ToString();
+                                var lastCodeBlock = fullText.LastIndexOf("```");
+                                if (lastCodeBlock >= 0)
+                                {
+                                    var possibleSummary = fullText.Substring(lastCodeBlock + 3).Trim();
+                                    if (!string.IsNullOrEmpty(possibleSummary))
+                                    {
+                                        onSummary?.Invoke(possibleSummary);
+                                    }
+                                }
                             }
                             break;
                         }
@@ -167,6 +208,141 @@ public class OllamaService
         {
             throw new Exception($"Streaming error: {ex.Message}", ex);
         }
+        finally
+        {
+            _updateTimer?.Stop();
+            _updateTimer?.Dispose();
+            _pendingContent = null;
+        }
+    }
+
+    private void ParseStreamContent(
+        string fullText,
+        ref StreamSection currentSection,
+        ref bool inCodeBlock,
+        ref int codeBlockCount,
+        ref string introText,
+        ref string summaryText,
+        StringBuilder codeBuffer,
+        Action<string> onIntro)
+    {
+        // Split by code blocks more reliably
+        var codeBlockPattern = @"```(?:[a-zA-Z]+\s*)?"; // Matches ``` with optional language identifier
+        var matches = Regex.Matches(fullText, codeBlockPattern);
+
+        if (matches.Count == 0)
+        {
+            // No code blocks yet, still in intro
+            if (currentSection == StreamSection.Intro)
+            {
+                introText = fullText.Trim();
+            }
+            return;
+        }
+
+        // We have at least one code block marker
+        if (matches.Count >= 1 && currentSection == StreamSection.Intro)
+        {
+            // Extract intro text (everything before first ```)
+            introText = fullText.Substring(0, matches[0].Index).Trim();
+            if (!string.IsNullOrEmpty(introText))
+            {
+                onIntro?.Invoke(introText);
+                currentSection = StreamSection.Code;
+                inCodeBlock = true;
+            }
+
+            // Start capturing code after the first ```
+            var codeStart = matches[0].Index + matches[0].Length;
+
+            if (matches.Count >= 2)
+            {
+                // We have a closing ``` - extract code between them
+                var codeEnd = matches[1].Index;
+                var code = fullText.Substring(codeStart, codeEnd - codeStart);
+                codeBuffer.Clear();
+                codeBuffer.Append(code);
+
+                // If there's text after the closing ```, it's the summary
+                if (matches[1].Index + 3 < fullText.Length)
+                {
+                    summaryText = fullText.Substring(matches[1].Index + 3).Trim();
+                    currentSection = StreamSection.Summary;
+                    inCodeBlock = false;
+                }
+            }
+            else
+            {
+                // Code block not closed yet, capture everything after opening ```
+                if (codeStart < fullText.Length)
+                {
+                    var code = fullText.Substring(codeStart);
+                    codeBuffer.Clear();
+                    codeBuffer.Append(code);
+                }
+            }
+        }
+        else if (currentSection == StreamSection.Code)
+        {
+            // We're already in code section, update the buffer
+            if (matches.Count >= 2)
+            {
+                // Code block is complete
+                var codeStart = matches[0].Index + matches[0].Length;
+                var codeEnd = matches[1].Index;
+                var code = fullText.Substring(codeStart, codeEnd - codeStart);
+                codeBuffer.Clear();
+                codeBuffer.Append(code);
+
+                // Extract summary
+                if (matches[1].Index + 3 < fullText.Length)
+                {
+                    summaryText = fullText.Substring(matches[1].Index + 3).Trim();
+                    currentSection = StreamSection.Summary;
+                    inCodeBlock = false;
+                }
+            }
+            else
+            {
+                // Still in open code block
+                var codeStart = matches[0].Index + matches[0].Length;
+                if (codeStart < fullText.Length)
+                {
+                    var code = fullText.Substring(codeStart);
+                    codeBuffer.Clear();
+                    codeBuffer.Append(code);
+                }
+            }
+        }
+    }
+
+    private string CleanCodeContent(string code)
+    {
+        if (string.IsNullOrEmpty(code))
+            return code;
+
+        // Remove any leading language identifiers (in case they slipped through)
+        var lines = code.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+
+        if (lines.Length > 0)
+        {
+            var firstLine = lines[0].Trim().ToLower();
+            // Check if first line is just a language identifier
+            var commonLangs = new[] { "csharp", "cs", "cshtml", "html", "javascript", "js", "typescript", "ts",
+                                      "json", "xml", "sql", "css", "python", "java", "cpp", "c++" };
+
+            if (commonLangs.Contains(firstLine))
+            {
+                // Skip the first line
+                lines = lines.Skip(1).ToArray();
+                code = string.Join(Environment.NewLine, lines);
+            }
+        }
+
+        // Trim any trailing ``` that might have been included
+        code = Regex.Replace(code, @"```\s*$", "");
+
+        return code;
     }
 
     private string GetStreamingSystemPrompt()
@@ -183,15 +359,16 @@ CRITICAL INSTRUCTIONS:
 3. Do not include language specifier after ``` (no ```csharp, just ```)
 4. Preserve all original formatting and structure except where changes are needed
 5. Apply ALL requested changes accurately
+6. Make sure to output the COMPLETE file, do not truncate
 
 EXAMPLE OUTPUT:
 I'll add the new validation method to the Product model.
 ```
-[COMPLETE FILE CONTENT HERE]
+[COMPLETE FILE CONTENT HERE - ENTIRE FILE FROM START TO END]
 ```
 Added validation method and updated the constructor to use it.
 
-IMPORTANT: Output ONLY in this format. No additional explanations or markdown.";
+IMPORTANT: Output ONLY in this format. The code block must contain the COMPLETE file.";
     }
 
     private string BuildStreamingUserPrompt(string userPrompt, FileContext primaryFile, List<FileContext> contextFiles)
@@ -200,6 +377,7 @@ IMPORTANT: Output ONLY in this format. No additional explanations or markdown.";
 
         // Add primary file
         prompt.AppendLine($"PRIMARY FILE TO MODIFY: {primaryFile.FileName}");
+        prompt.AppendLine("Current content:");
         prompt.AppendLine("```");
         prompt.AppendLine(primaryFile.Content);
         prompt.AppendLine("```");
@@ -220,17 +398,9 @@ IMPORTANT: Output ONLY in this format. No additional explanations or markdown.";
         }
 
         prompt.AppendLine($"USER REQUEST: {userPrompt}");
-        prompt.AppendLine("\nPlease provide the complete updated file content.");
+        prompt.AppendLine("\nPlease provide the COMPLETE updated file content. Do not truncate.");
 
         return prompt.ToString();
-    }
-
-    // Keep the old method for backward compatibility but mark as deprecated
-    [Obsolete("Use StreamCodeCompletion for better performance")]
-    public async Task<FileReplacementResult> ProcessCodeEditRequest(string userPrompt, string fileContent, string fileName)
-    {
-        // Implementation remains for backward compatibility
-        throw new NotImplementedException("This method is deprecated. Use StreamCodeCompletion instead.");
     }
 
     public DiffSummary GetDiffSummary(string original, string modified)
@@ -291,7 +461,6 @@ public class DiffSummary
     public int LinesChanged { get; set; }
 }
 
-// Keep old models for compatibility
 public class FileReplacementResult
 {
     public bool Success { get; set; }
