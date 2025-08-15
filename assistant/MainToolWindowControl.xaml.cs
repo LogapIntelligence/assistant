@@ -28,7 +28,7 @@ namespace assistant
         private OllamaService _ollamaService;
         private CommandProcessor _commandProcessor;
         private PathConfiguration _pathConfig;
-        private CodeEditApplicator _editApplicator;
+        // CodeEditApplicator is no longer needed for complete replacement
 
         public MainToolWindowControl()
         {
@@ -44,7 +44,7 @@ namespace assistant
             _ollamaService = new OllamaService();
             _pathConfig = PathConfiguration.Load();
             _commandProcessor = new CommandProcessor(_pathConfig);
-            _editApplicator = new CodeEditApplicator(0.90); // 90% similarity threshold
+            // No need to initialize CodeEditApplicator anymore
 
             ConsoleOutput.ItemsSource = _messages;
 
@@ -296,33 +296,33 @@ namespace assistant
                     return;
                 }
 
-                // Send to Ollama for code edit processing
-                var editResult = await _ollamaService.ProcessCodeEditRequest(
+                // Send to Ollama for complete file replacement
+                var result = await _ollamaService.ProcessCodeEditRequest(
                     prompt,
                     context.Content,
                     context.FileName
                 );
 
-                if (!editResult.Success)
+                if (!result.Success)
                 {
-                    AddMessage($"AI Error: {editResult.Error}", MessageType.Error);
+                    AddMessage($"AI Error: {result.Error}", MessageType.Error);
                     return;
                 }
 
                 // Display the summary
-                if (!string.IsNullOrEmpty(editResult.Summary))
+                if (!string.IsNullOrEmpty(result.Summary))
                 {
-                    AddMessage($"AI: {editResult.Summary}", MessageType.AI);
+                    AddMessage($"AI: {result.Summary}", MessageType.AI);
                 }
 
-                // Apply the edits if any
-                if (editResult.Edits != null && editResult.Edits.Any())
+                // Apply the complete file replacement
+                if (!string.IsNullOrEmpty(result.UpdatedContent))
                 {
-                    await ApplyCodeEdits(context, editResult.Edits);
+                    await ApplyCompleteFileReplacement(context, result);
                 }
                 else
                 {
-                    AddMessage("No code changes suggested.", MessageType.Info);
+                    AddMessage("No changes were made to the file.", MessageType.Info);
                 }
             }
             catch (Exception ex)
@@ -379,55 +379,45 @@ namespace assistant
             }
         }
 
-        private async Task ApplyCodeEdits(FileContext context, List<CodeEdit> edits)
+        private async Task ApplyCompleteFileReplacement(FileContext context, FileReplacementResult result)
         {
             try
             {
-                // Apply edits using the CodeEditApplicator
-                var applyResult = _editApplicator.ApplyEdits(context.Content, edits);
+                // Calculate diff summary for user feedback
+                var diffSummary = _ollamaService.GetDiffSummary(context.Content, result.UpdatedContent);
 
-                if (!applyResult.Success)
+                // Update the document with the complete new content
+                await UpdateDocumentContent(result.UpdatedContent);
+
+                // Display success message
+                AddMessage("✓ File updated successfully!", MessageType.Success);
+
+                // Display specific changes if provided
+                if (result.Changes != null && result.Changes.Any())
                 {
-                    AddMessage($"Failed to apply edits: {applyResult.Message}", MessageType.Error);
-                    return;
-                }
-
-                // Update the document with the modified content
-                await UpdateDocumentContent(applyResult.ModifiedContent);
-
-                // Display results
-                AddMessage("✓ Code changes applied successfully:", MessageType.Success);
-
-                foreach (var appliedEdit in applyResult.AppliedEdits)
-                {
-                    if (appliedEdit.Success)
+                    AddMessage("Changes made:", MessageType.Info);
+                    foreach (var change in result.Changes)
                     {
-                        var similarityInfo = appliedEdit.MatchSimilarity < 1.0
-                            ? $" (match: {appliedEdit.MatchSimilarity:P0})"
-                            : "";
-                        AddMessage($"  • {appliedEdit.Edit.Type}: {appliedEdit.Edit.Reason}{similarityInfo}",
-                                 MessageType.Success);
-                    }
-                    else
-                    {
-                        AddMessage($"  ✗ Failed: {appliedEdit.Edit.Reason} - {appliedEdit.Message}",
-                                 MessageType.Error);
+                        AddMessage($"  • {change}", MessageType.Success);
                     }
                 }
 
-                // Show summary
-                var successCount = applyResult.AppliedEdits.Count(e => e.Success);
-                var totalCount = applyResult.AppliedEdits.Count;
-
-                if (successCount < totalCount)
+                // Display diff statistics
+                if (diffSummary.LinesAdded > 0 || diffSummary.LinesRemoved > 0 || diffSummary.LinesChanged > 0)
                 {
-                    AddMessage($"\nSummary: {successCount}/{totalCount} edits applied successfully",
-                             MessageType.Info);
+                    AddMessage($"\nFile statistics:", MessageType.Info);
+                    if (diffSummary.LinesAdded > 0)
+                        AddMessage($"  • Lines added: {diffSummary.LinesAdded}", MessageType.Info);
+                    if (diffSummary.LinesRemoved > 0)
+                        AddMessage($"  • Lines removed: {diffSummary.LinesRemoved}", MessageType.Info);
+                    if (diffSummary.LinesChanged > 0)
+                        AddMessage($"  • Lines modified: {diffSummary.LinesChanged}", MessageType.Info);
+                    AddMessage($"  • Total lines: {diffSummary.ModifiedLineCount} (was {diffSummary.OriginalLineCount})", MessageType.Info);
                 }
             }
             catch (Exception ex)
             {
-                AddMessage($"Error applying code edits: {ex.Message}", MessageType.Error);
+                AddMessage($"Error applying file changes: {ex.Message}", MessageType.Error);
             }
         }
 
@@ -548,6 +538,4 @@ namespace assistant
         public string Content { get; set; }
         public string Language { get; set; }
     }
-
-    // Remove old CodeChange class as it's no longer needed
 }

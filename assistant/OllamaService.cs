@@ -11,7 +11,7 @@ public class OllamaService
 {
     private readonly HttpClient _httpClient;
     private readonly string _baseUrl = "http://localhost:11434";
-    private readonly string _model = "phi4-mini";
+    private readonly string _model = "qwen3-coder";
     private readonly JsonSerializerOptions _jsonOptions;
 
     public OllamaService()
@@ -41,7 +41,7 @@ public class OllamaService
         }
     }
 
-    public async Task<EditResult> ProcessCodeEditRequest(string userPrompt, string fileContent, string fileName)
+    public async Task<FileReplacementResult> ProcessCodeEditRequest(string userPrompt, string fileContent, string fileName)
     {
         try
         {
@@ -59,7 +59,7 @@ public class OllamaService
                 {
                     temperature = 0.1,
                     top_p = 0.9,
-                    num_predict = 3000,
+                    num_predict = 8000,  // Increased for full file content
                     seed = 42
                 }
             };
@@ -71,7 +71,7 @@ public class OllamaService
 
             if (!response.IsSuccessStatusCode)
             {
-                return new EditResult
+                return new FileReplacementResult
                 {
                     Success = false,
                     Error = $"API Error: {response.StatusCode}"
@@ -83,21 +83,22 @@ public class OllamaService
 
             if (ollamaResponse?.Message?.Content != null)
             {
-                var editResponse = JsonSerializer.Deserialize<CodeEditResponse>(
+                var replacementResponse = JsonSerializer.Deserialize<CodeReplacementResponse>(
                     ollamaResponse.Message.Content, _jsonOptions);
 
-                // Post-process to validate and fix common issues
-                editResponse = PostProcessResponse(editResponse, fileContent);
+                // Validate and clean the response
+                replacementResponse = PostProcessResponse(replacementResponse);
 
-                return new EditResult
+                return new FileReplacementResult
                 {
                     Success = true,
-                    Edits = editResponse.Edits,
-                    Summary = editResponse.Summary
+                    UpdatedContent = replacementResponse.UpdatedFile,
+                    Summary = replacementResponse.Summary,
+                    Changes = replacementResponse.Changes
                 };
             }
 
-            return new EditResult
+            return new FileReplacementResult
             {
                 Success = false,
                 Error = "No response from model"
@@ -105,7 +106,7 @@ public class OllamaService
         }
         catch (JsonException jsonEx)
         {
-            return new EditResult
+            return new FileReplacementResult
             {
                 Success = false,
                 Error = $"Model returned invalid JSON: {jsonEx.Message}"
@@ -113,7 +114,7 @@ public class OllamaService
         }
         catch (Exception ex)
         {
-            return new EditResult
+            return new FileReplacementResult
             {
                 Success = false,
                 Error = $"Unexpected error: {ex.Message}"
@@ -121,37 +122,37 @@ public class OllamaService
         }
     }
 
-    private CodeEditResponse PostProcessResponse(CodeEditResponse response, string fileContent)
+    private CodeReplacementResponse PostProcessResponse(CodeReplacementResponse response)
     {
-        foreach (var edit in response.Edits)
+        // Clean up any potential formatting issues
+        if (!string.IsNullOrEmpty(response.UpdatedFile))
         {
-            // Fix common issue: Append operations including source in new field
-            if (edit.Type == "Append" && !string.IsNullOrEmpty(edit.New))
+            // Remove any potential markdown code blocks if present
+            response.UpdatedFile = response.UpdatedFile.Trim();
+
+            // Remove ```csharp or ``` markers if they exist
+            if (response.UpdatedFile.StartsWith("```"))
             {
-                // Remove source line if it appears at the start of new field
-                if (edit.New.TrimStart().StartsWith(edit.Source.Trim()))
+                var lines = response.UpdatedFile.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                if (lines.Length > 2)
                 {
-                    var sourceLength = edit.Source.Trim().Length;
-                    var startIndex = edit.New.IndexOf(edit.Source.Trim());
-                    if (startIndex >= 0)
+                    // Remove first and last line if they are code block markers
+                    var firstLine = lines[0].Trim();
+                    var lastLine = lines[lines.Length - 1].Trim();
+
+                    if (firstLine.StartsWith("```") && lastLine == "```")
                     {
-                        edit.New = edit.New.Substring(startIndex + sourceLength).TrimStart('\n', '\r');
+                        response.UpdatedFile = string.Join(Environment.NewLine,
+                            lines.Skip(1).Take(lines.Length - 2));
                     }
                 }
             }
+        }
 
-            // Ensure Remove operations have empty new field
-            if (edit.Type == "Remove")
-            {
-                edit.New = "";
-            }
-
-            // Validate source exists in file
-            if (!fileContent.Contains(edit.Source))
-            {
-                // Log warning or handle as needed
-                Console.WriteLine($"Warning: Source not found in file for edit: {edit.Reason}");
-            }
+        // Ensure changes list is not null
+        if (response.Changes == null)
+        {
+            response.Changes = new List<string>();
         }
 
         return response;
@@ -159,49 +160,34 @@ public class OllamaService
 
     private string GetSystemPrompt()
     {
-        return @"You are a code editing assistant. Respond with ONLY valid JSON.
+        return @"You are a code editing assistant. You will receive a file and a modification request.
+Your task is to return the COMPLETE updated file content with all requested changes applied.
+
+CRITICAL INSTRUCTIONS:
+1. Return ONLY valid JSON in the specified format
+2. The 'updatedFile' field must contain the ENTIRE file content after modifications
+3. Do not use markdown code blocks in the updatedFile field
+4. Preserve all original formatting, indentation, and structure except where changes are needed
+5. Apply ALL requested changes accurately
+6. Include a clear summary of what was changed
+7. List specific changes made in the 'changes' array
 
 RESPONSE FORMAT:
 {
-  ""edits"": [
-    {
-      ""source"": ""<EXACT text to match>"",
-      ""new"": ""<new content - see rules below>"",
-      ""type"": ""<Replace|Append|Remove>"",
-      ""reason"": ""<brief explanation>""
-    }
-  ],
-  ""summary"": ""<overall summary>""
+  ""updatedFile"": ""<COMPLETE file content with all changes applied>"",
+  ""summary"": ""<Brief summary of all changes made>"",
+  ""changes"": [
+    ""<Specific change 1>"",
+    ""<Specific change 2>"",
+    ...
+  ]
 }
 
-EDIT TYPE RULES - FOLLOW EXACTLY:
-
-1. **Replace**: Replaces source with new content
-   - source: The exact text to replace
-   - new: The complete replacement text
-   
-2. **Append**: Adds new content AFTER source (source stays unchanged)
-   - source: The single line after which to append
-   - new: ONLY the new content to add (DO NOT include the source line)
-   
-3. **Remove**: Deletes the source
-   - source: The exact text to remove
-   - new: MUST be empty string """"
-
-CRITICAL FOR APPEND:
-The 'new' field must contain ONLY the content being added, NOT the source line.
-✓ CORRECT: source: ""<h1>Title</h1>"", new: ""<button>Click</button>""
-✗ WRONG: source: ""<h1>Title</h1>"", new: ""<h1>Title</h1>\n<button>Click</button>""
-
-SOURCE SELECTION STRATEGY:
-- APPEND: Use single line as source (the line you're adding after)
-- REPLACE: Use entire logical block when modifying internals
-- REMOVE: Remove complete logical units
-
-MATCHING RULES:
-- Copy source text EXACTLY including all spaces and indentation
-- Never paraphrase or approximate
-- Match quotes and special characters precisely";
+IMPORTANT:
+- The updatedFile field contains the ENTIRE file, not just the changed parts
+- Maintain exact indentation and formatting from the original file
+- Do not add explanatory comments unless specifically requested
+- Ensure the code remains syntactically correct after changes";
     }
 
     private string BuildUserPrompt(string userPrompt, string fileContent, string fileName)
@@ -209,15 +195,13 @@ MATCHING RULES:
         var prompt = new StringBuilder();
 
         prompt.AppendLine($"File: {fileName}");
-        prompt.AppendLine("\n```");
+        prompt.AppendLine("\nCurrent file content:");
+        prompt.AppendLine("```");
         prompt.AppendLine(fileContent);
-        prompt.AppendLine("```\n");
-        prompt.AppendLine($"Request: {userPrompt}");
-        prompt.AppendLine("\nREMINDER - Edit Type Rules:");
-        prompt.AppendLine("• Replace: new = complete replacement text");
-        prompt.AppendLine("• Append: new = ONLY the added content (NOT including source line)");
-        prompt.AppendLine("• Remove: new = empty string \"\"");
-        prompt.AppendLine("\nProvide JSON with exact source matches from the code above.");
+        prompt.AppendLine("```");
+        prompt.AppendLine($"\nRequested modification: {userPrompt}");
+        prompt.AppendLine("\nPlease return the COMPLETE updated file with all requested changes applied.");
+        prompt.AppendLine("Remember to return ONLY valid JSON with the entire file content in the 'updatedFile' field.");
 
         return prompt.ToString();
     }
@@ -229,134 +213,108 @@ MATCHING RULES:
             type = "object",
             properties = new
             {
-                edits = new
+                updatedFile = new
+                {
+                    type = "string",
+                    description = "The complete file content with all modifications applied"
+                },
+                summary = new
+                {
+                    type = "string",
+                    description = "Brief summary of all changes made"
+                },
+                changes = new
                 {
                     type = "array",
-                    items = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            source = new { type = "string", description = "Exact text to match from the file" },
-                            @new = new { type = "string", description = "For Replace: replacement text, For Append: ONLY new content to add, For Remove: empty string" },
-                            type = new
-                            {
-                                type = "string",
-                                @enum = new[] { "Replace", "Append", "Remove" },
-                                description = "Edit operation type"
-                            },
-                            reason = new { type = "string", description = "Brief explanation of the change" }
-                        },
-                        required = new[] { "source", "new", "type", "reason" }
-                    },
-                    minItems = 1
-                },
-                summary = new { type = "string", description = "Overall summary of all changes" }
+                    items = new { type = "string" },
+                    description = "List of specific changes made to the file"
+                }
             },
-            required = new[] { "edits", "summary" }
+            required = new[] { "updatedFile", "summary", "changes" }
         };
     }
 
-    // Additional helper method to validate edits before applying
-    public bool ValidateEdit(CodeEdit edit, string fileContent)
+    // Method to compare original and modified content to generate a diff summary
+    public DiffSummary GetDiffSummary(string original, string modified)
     {
-        // Check if source exists in file
-        if (!fileContent.Contains(edit.Source))
+        var originalLines = original.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+        var modifiedLines = modified.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+
+        var summary = new DiffSummary
         {
-            return false;
-        }
+            OriginalLineCount = originalLines.Length,
+            ModifiedLineCount = modifiedLines.Length,
+            LinesAdded = Math.Max(0, modifiedLines.Length - originalLines.Length),
+            LinesRemoved = Math.Max(0, originalLines.Length - modifiedLines.Length)
+        };
 
-        // Validate based on type
-        switch (edit.Type)
+        // Simple diff detection (could be enhanced with more sophisticated algorithm)
+        int minLength = Math.Min(originalLines.Length, modifiedLines.Length);
+        for (int i = 0; i < minLength; i++)
         {
-            case "Append":
-                // New field should not contain the source
-                if (!string.IsNullOrEmpty(edit.New) && edit.New.Contains(edit.Source))
-                {
-                    Console.WriteLine("Warning: Append operation contains source in new field");
-                    return false;
-                }
-                break;
-
-            case "Remove":
-                // New field must be empty
-                if (!string.IsNullOrEmpty(edit.New))
-                {
-                    Console.WriteLine("Warning: Remove operation has non-empty new field");
-                    return false;
-                }
-                break;
-
-            case "Replace":
-                // New field should have content (unless intentionally replacing with empty)
-                // This is valid, just log if empty
-                if (string.IsNullOrEmpty(edit.New))
-                {
-                    Console.WriteLine("Info: Replace operation with empty new field");
-                }
-                break;
-
-            default:
-                Console.WriteLine($"Warning: Unknown edit type: {edit.Type}");
-                return false;
-        }
-
-        return true;
-    }
-
-    // Method to apply edits to file content
-    public string ApplyEdits(string fileContent, List<CodeEdit> edits)
-    {
-        var result = fileContent;
-
-        // Sort edits by position in file (reverse order to maintain positions)
-        var sortedEdits = edits.OrderByDescending(e => fileContent.IndexOf(e.Source)).ToList();
-
-        foreach (var edit in sortedEdits)
-        {
-            if (!ValidateEdit(edit, result))
+            if (originalLines[i] != modifiedLines[i])
             {
-                Console.WriteLine($"Skipping invalid edit: {edit.Reason}");
-                continue;
-            }
-
-            switch (edit.Type)
-            {
-                case "Replace":
-                    result = result.Replace(edit.Source, edit.New);
-                    break;
-
-                case "Append":
-                    var index = result.IndexOf(edit.Source);
-                    if (index >= 0)
-                    {
-                        var insertPosition = index + edit.Source.Length;
-                        // Add newline if not present
-                        var newContent = edit.New.StartsWith("\n") ? edit.New : "\n" + edit.New;
-                        result = result.Insert(insertPosition, newContent);
-                    }
-                    break;
-
-                case "Remove":
-                    result = result.Replace(edit.Source, "");
-                    break;
+                summary.LinesChanged++;
             }
         }
 
-        return result;
+        return summary;
     }
 }
 
 // Response Models
-public class CodeEditResponse
+public class CodeReplacementResponse
 {
-    [JsonPropertyName("edits")]
-    public List<CodeEdit> Edits { get; set; } = new List<CodeEdit>();
+    [JsonPropertyName("updatedFile")]
+    public string UpdatedFile { get; set; }
 
     [JsonPropertyName("summary")]
     public string Summary { get; set; }
+
+    [JsonPropertyName("changes")]
+    public List<string> Changes { get; set; } = new List<string>();
 }
 
+public class FileReplacementResult
+{
+    public bool Success { get; set; }
+    public string Error { get; set; }
+    public string UpdatedContent { get; set; }
+    public string Summary { get; set; }
+    public List<string> Changes { get; set; }
+}
+
+public class DiffSummary
+{
+    public int OriginalLineCount { get; set; }
+    public int ModifiedLineCount { get; set; }
+    public int LinesAdded { get; set; }
+    public int LinesRemoved { get; set; }
+    public int LinesChanged { get; set; }
+}
+
+// Internal Models (unchanged)
+internal class OllamaChatResponse
+{
+    public OllamaMessage Message { get; set; }
+}
+
+internal class OllamaMessage
+{
+    public string Content { get; set; }
+}
+
+// Legacy models - kept for backward compatibility but deprecated
+[Obsolete("Use FileReplacementResult instead")]
+public class EditResult
+{
+    public bool Success { get; set; }
+    public string Error { get; set; }
+    public List<CodeEdit> Edits { get; set; }
+    public string Summary { get; set; }
+}
+
+[Obsolete("No longer used in complete replacement mode")]
 public class CodeEdit
 {
     [JsonPropertyName("source")]
@@ -366,28 +324,18 @@ public class CodeEdit
     public string New { get; set; }
 
     [JsonPropertyName("type")]
-    public string Type { get; set; } // Replace, Append, Remove
+    public string Type { get; set; }
 
     [JsonPropertyName("reason")]
     public string Reason { get; set; }
 }
 
-// Result Models
-public class EditResult
+[Obsolete("Use CodeReplacementResponse instead")]
+public class CodeEditResponse
 {
-    public bool Success { get; set; }
-    public string Error { get; set; }
-    public List<CodeEdit> Edits { get; set; }
+    [JsonPropertyName("edits")]
+    public List<CodeEdit> Edits { get; set; } = new List<CodeEdit>();
+
+    [JsonPropertyName("summary")]
     public string Summary { get; set; }
-}
-
-// Internal Models
-internal class OllamaChatResponse
-{
-    public OllamaMessage Message { get; set; }
-}
-
-internal class OllamaMessage
-{
-    public string Content { get; set; }
 }
